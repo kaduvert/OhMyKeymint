@@ -22,7 +22,40 @@ use crate::top::qwq2333::ohmykeymint::IOhMyMaintenanceService::IOhMyMaintenanceS
 
 const RPC_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const RPC_READY_RETRY_DELAY: Duration = Duration::from_millis(200);
-const PM_SERVICE: &str = "sec_key_att_app_id_provider";
+
+/// Samsung-specific binder service name for IKeyAttestationApplicationIdProvider.
+const PM_SERVICE_SAMSUNG: &str = "sec_key_att_app_id_provider";
+/// AOSP canonical service name for IKeyAttestationApplicationIdProvider.
+const PM_SERVICE_AOSP: &str = "android.security.keystore.IKeyAttestationApplicationIdProvider";
+
+/// Returns the service name for IKeyAttestationApplicationIdProvider if it is
+/// registered on this device, or `None` if neither the Samsung nor the AOSP
+/// variant is present.
+///
+/// Result is cached in a OnceLock — the servicemanager is only consulted once.
+/// On LineageOS / AOSP ROMs that omit this service both lookups return `None`
+/// (absent services → null response → correctly handled as not-found).
+fn aaid_service_name() -> Option<&'static str> {
+    use std::sync::OnceLock;
+    static NAME: OnceLock<Option<&'static str>> = OnceLock::new();
+    *NAME.get_or_init(|| {
+        // ensure_process_state() is always called by callers before we reach here.
+        if hub::check_service(PM_SERVICE_SAMSUNG).is_some() {
+            log::debug!("AAID provider: Samsung ({PM_SERVICE_SAMSUNG})");
+            Some(PM_SERVICE_SAMSUNG)
+        } else if hub::check_service(PM_SERVICE_AOSP).is_some() {
+            log::debug!("AAID provider: AOSP ({PM_SERVICE_AOSP})");
+            Some(PM_SERVICE_AOSP)
+        } else {
+            log::debug!(
+                "IKeyAttestationApplicationIdProvider absent \
+                 (tried {PM_SERVICE_SAMSUNG} and {PM_SERVICE_AOSP}); \
+                 will use resolvePackagesByUid via OMK service"
+            );
+            None
+        }
+    })
+}
 
 thread_local! {
     static PM: RefCell<Option<Strong<dyn IKeyAttestationApplicationIdProvider>>> = const { RefCell::new(None) };
@@ -82,7 +115,7 @@ struct PmDeathRecipient;
 impl DeathRecipient for PmDeathRecipient {
     fn binder_died(&self, _who: &WIBinder) {
         clear_pm_cache();
-        warn!("{} binder died; cache cleared", PM_SERVICE);
+        warn!("IKeyAttestationApplicationIdProvider binder died; cache cleared");
     }
 }
 
@@ -466,16 +499,42 @@ fn resolve_package_names_for_uid(uid: u32) -> Result<Vec<String>> {
 }
 
 fn resolve_package_names_for_uid_once(uid: u32) -> Result<Vec<String>> {
-    let app_id = with_pm_retry(|pm| {
+    // ensure_process_state() must run before aaid_service_name() (inside get_pm)
+    // so that hub operations work in the OnceLock closure on first call.
+    ensure_process_state();
+
+    // Primary path: IKeyAttestationApplicationIdProvider.
+    // get_pm() fails fast (no binder traffic) when aaid_service_name() cached None,
+    // i.e. on LineageOS / AOSP ROMs that don't ship this service.
+    let aaid = with_pm_retry(|pm| {
         pm.getKeyAttestationApplicationId(uid as i32)
             .context("getKeyAttestationApplicationId failed")
-    })?;
-    Ok(app_id
-        .packageInfos
-        .into_iter()
-        .map(|pkg| pkg.packageName)
-        .filter(|pkg| !pkg.is_empty())
-        .collect())
+    });
+    if let Ok(app_id) = aaid {
+        let packages: Vec<String> = app_id
+            .packageInfos
+            .into_iter()
+            .map(|p| p.packageName)
+            .filter(|p| !p.is_empty())
+            .collect();
+        if !packages.is_empty() {
+            return Ok(packages);
+        }
+    }
+
+    // Fallback: ask the OMK main daemon via IOhMyKsService::resolvePackagesByUid.
+    // The daemon runs in a privileged context where IPackageManagerNative is always
+    // reachable, so this works on LineageOS 22.x and any other AOSP-based ROM
+    // regardless of Android version.
+    with_omk_retry(|omk| {
+        let packages = omk
+            .resolvePackagesByUid(uid as i32)
+            .context("resolvePackagesByUid failed")?;
+        if packages.is_empty() {
+            anyhow::bail!("empty package list for uid {uid} from OMK service");
+        }
+        Ok(packages)
+    })
 }
 
 fn get_pm() -> Result<Strong<dyn IKeyAttestationApplicationIdProvider>> {
@@ -485,14 +544,21 @@ fn get_pm() -> Result<Strong<dyn IKeyAttestationApplicationIdProvider>> {
             return Ok(client.clone());
         }
 
+        // aaid_service_name() probes once and caches the result.  Returns None on
+        // LineageOS / AOSP builds that don't ship this service, causing get_pm() to
+        // fail fast so resolve_package_names_for_uid_once() can try the OMK fallback.
+        let service_name = aaid_service_name()
+            .ok_or_else(|| anyhow::anyhow!(
+                "IKeyAttestationApplicationIdProvider not available on this device"
+            ))?;
         let client: Strong<dyn IKeyAttestationApplicationIdProvider> =
-            hub::check_interface(PM_SERVICE)
-                .context("failed to connect to sec_key_att_app_id_provider")?;
+            hub::check_interface(service_name)
+                .context("failed to connect to IKeyAttestationApplicationIdProvider")?;
         let recipient: Arc<dyn DeathRecipient> = Arc::new(PmDeathRecipient);
         client
             .as_binder()
             .link_to_death(Arc::downgrade(&recipient))
-            .context("failed to watch sec_key_att_app_id_provider death")?;
+            .context("failed to watch IKeyAttestationApplicationIdProvider death")?;
         PM_DEATH.with(|death| *death.borrow_mut() = Some(recipient));
         *slot.borrow_mut() = Some(client.clone());
         Ok(client)
@@ -504,7 +570,7 @@ where
     F: FnMut(&Strong<dyn IKeyAttestationApplicationIdProvider>) -> Result<T>,
 {
     with_binder_retry(
-        "sec_key_att_app_id_provider",
+        "IKeyAttestationApplicationIdProvider",
         get_pm,
         |_| clear_pm_cache(),
         is_dead_object_error,

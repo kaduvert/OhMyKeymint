@@ -51,4 +51,13 @@ interface IOhMyKsService {
     boolean isOmkGrant(in @nullable CallerInfo ctx, in KeyDescriptor grant);
 
     String[] resolveIsolatedCallerPackages(in @nullable CallerInfo ctx);
+
+    /**
+     * Resolve the package name(s) for a regular (non-isolated) app UID.
+     * Implemented by the daemon using IPackageManagerNative, which is reachable
+     * from the daemon's privileged context on all AOSP/LineageOS builds regardless
+     * of Android version.  Called by the injector as a fallback when
+     * IKeyAttestationApplicationIdProvider is absent (e.g. LineageOS 22.x).
+     */
+    String[] resolvePackagesByUid(int uid);
 }

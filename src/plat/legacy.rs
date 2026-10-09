@@ -9,9 +9,18 @@ use crate::android::security::keystore::{
     KeyAttestationPackageInfo::KeyAttestationPackageInfo, Signature::Signature,
 };
 
-const PROVIDER_SERVICE: &str = "sec_key_att_app_id_provider";
-const LEGACY_PROVIDER_DESCRIPTOR: &str =
+/// Samsung-specific binder service name (Android ≤ 14 legacy path).
+const PROVIDER_SERVICE_SAMSUNG: &str = "sec_key_att_app_id_provider";
+/// AOSP / LineageOS service name (Android ≤ 14 legacy path).
+const PROVIDER_SERVICE_AOSP: &str =
+    "android.security.keystore.IKeyAttestationApplicationIdProvider";
+
+/// Samsung / very-old-AOSP descriptor (keymaster package).
+const LEGACY_PROVIDER_DESCRIPTOR_KEYMASTER: &str =
     "android.security.keymaster.IKeyAttestationApplicationIdProvider";
+/// AOSP descriptor used from Android 10 onwards (keystore package).
+const LEGACY_PROVIDER_DESCRIPTOR_KEYSTORE: &str =
+    "android.security.keystore.IKeyAttestationApplicationIdProvider";
 const NULL_PARCELABLE: i32 = 0;
 const NONNULL_PARCELABLE: i32 = 1;
 const NULL_VECTOR_SIZE: i32 = -1;
@@ -75,12 +84,29 @@ fn get_provider_binder() -> Result<SIBinder> {
             return Ok(provider.clone());
         }
 
-        let provider = hub::try_get_service(PROVIDER_SERVICE)
+        // Try Samsung-specific name first; fall back to the AOSP canonical name
+        // used by LineageOS and stock Android 10+ builds.
+        let provider = hub::try_get_service(PROVIDER_SERVICE_SAMSUNG)
             .ok()
             .flatten()
-            .ok_or_else(|| anyhow::anyhow!("service {PROVIDER_SERVICE} unavailable"))?;
+            .or_else(|| {
+                hub::try_get_service(PROVIDER_SERVICE_AOSP)
+                    .ok()
+                    .flatten()
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "IKeyAttestationApplicationIdProvider unavailable \
+                     (tried {PROVIDER_SERVICE_SAMSUNG} and {PROVIDER_SERVICE_AOSP})"
+                )
+            })?;
+
+        // Accept both the old keymaster-package descriptor (Samsung / pre-Android 10
+        // AOSP) and the new keystore-package descriptor (AOSP Android 10+, LineageOS).
         let descriptor = provider.descriptor();
-        if descriptor != LEGACY_PROVIDER_DESCRIPTOR {
+        if descriptor != LEGACY_PROVIDER_DESCRIPTOR_KEYMASTER
+            && descriptor != LEGACY_PROVIDER_DESCRIPTOR_KEYSTORE
+        {
             bail!("legacy key attestation provider descriptor mismatch: {descriptor}");
         }
 

@@ -900,4 +900,10 @@ impl IOhMyKsService for KeystoreService {
         crate::plat::resetprop::runtime_isolated_caller_packages(uid, pid)
             .map_err(into_logged_binder)
     }
+
+    fn resolvePackagesByUid(&self, uid: i32) -> Result<Vec<String>, Status> {
+        let _wp = wd::watch("IOhMyKsService::resolvePackagesByUid");
+        crate::plat::utils::get_packages_for_uid(uid as u32)
+            .map_err(into_logged_binder)
+    }
 }

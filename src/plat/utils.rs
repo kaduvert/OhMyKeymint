@@ -9,9 +9,11 @@ use log::{debug, warn};
 use rsbinder::DeathRecipient;
 
 use crate::android::apex::IApexService::IApexService;
+use crate::android::content::pm::IPackageManagerNative::IPackageManagerNative;
 use crate::android::security::keystore::IKeyAttestationApplicationIdProvider::IKeyAttestationApplicationIdProvider;
 use crate::android::security::keystore::KeyAttestationApplicationId::KeyAttestationApplicationId;
 use crate::android::security::keystore::KeyAttestationPackageInfo::KeyAttestationPackageInfo;
+use crate::android::security::keystore::Signature::Signature;
 use crate::android::system::keystore2::{
     IKeystoreService::IKeystoreService, ResponseCode::ResponseCode,
 };
@@ -19,6 +21,35 @@ use crate::err;
 use crate::keymaster::apex::ApexModuleInfo;
 use crate::keymaster::error::KsError;
 use crate::keymaster::utils::get_interface_once;
+
+const PM_SERVICE_SAMSUNG: &str = "sec_key_att_app_id_provider";
+const PM_SERVICE_AOSP: &str = "android.security.keystore.IKeyAttestationApplicationIdProvider";
+const PACKAGE_MANAGER_NATIVE_SERVICE: &str = "package_native";
+
+#[derive(Clone, Copy, Debug)]
+enum PmBackend {
+    KeyAttestation { service: &'static str },
+    PackageNative,
+}
+
+fn pm_backend() -> PmBackend {
+    static BACKEND: OnceLock<PmBackend> = OnceLock::new();
+    *BACKEND.get_or_init(|| {
+        if rsbinder::hub::check_service(PM_SERVICE_SAMSUNG).is_some() {
+            debug!("using Samsung AAID provider at {PM_SERVICE_SAMSUNG}");
+            PmBackend::KeyAttestation { service: PM_SERVICE_SAMSUNG }
+        } else if rsbinder::hub::check_service(PM_SERVICE_AOSP).is_some() {
+            debug!("using AOSP AAID provider at {PM_SERVICE_AOSP}");
+            PmBackend::KeyAttestation { service: PM_SERVICE_AOSP }
+        } else {
+            debug!(
+                "neither AAID provider registered; \
+                 falling back to {PACKAGE_MANAGER_NATIVE_SERVICE}"
+            );
+            PmBackend::PackageNative
+        }
+    })
+}
 
 thread_local! {
     static PM: Mutex<Option<rsbinder::Strong<dyn IKeyAttestationApplicationIdProvider>>> = Mutex::new(None);
@@ -73,9 +104,17 @@ fn get_pm() -> anyhow::Result<rsbinder::Strong<dyn IKeyAttestationApplicationIdP
         if let Some(client) = slot.as_ref() {
             return Ok(client.clone());
         }
-
+        let service_name = match pm_backend() {
+            PmBackend::KeyAttestation { service } => service,
+            PmBackend::PackageNative => {
+                anyhow::bail!(
+                    "IKeyAttestationApplicationIdProvider not available; \
+                     get_pm() called with PackageNative backend"
+                )
+            }
+        };
         let client: rsbinder::Strong<dyn IKeyAttestationApplicationIdProvider> =
-            get_interface_once("sec_key_att_app_id_provider")?;
+            get_interface_once(service_name)?;
         *slot = Some(client.clone());
         Ok(client)
     })
@@ -168,9 +207,97 @@ pub fn get_aaid(uid: u32) -> anyhow::Result<Vec<u8>> {
     encode_application_id(application_id)
 }
 
+/// Resolve the package name(s) for a UID via `IPackageManagerNative::getNamesForUids`.
+///
+/// This works reliably from the daemon's privileged process context on all AOSP
+/// and LineageOS builds.  It is the implementation behind
+/// `IOhMyKsService::resolvePackagesByUid`, called by the injector when
+/// `IKeyAttestationApplicationIdProvider` is absent on the device.
+pub fn get_packages_for_uid(uid: u32) -> anyhow::Result<Vec<String>> {
+    let pm: rsbinder::Strong<dyn IPackageManagerNative> =
+        get_interface_once(PACKAGE_MANAGER_NATIVE_SERVICE)
+            .map_err(|e| anyhow::anyhow!("failed to connect to package_native: {e:?}"))?;
+    let names = pm
+        .getNamesForUids(&[uid as i32])
+        .map_err(|e| anyhow::anyhow!("getNamesForUids({uid}) failed: {e:?}"))?;
+    let packages: Vec<String> = names.into_iter().filter(|s| !s.is_empty()).collect();
+    if packages.is_empty() {
+        anyhow::bail!("no packages found for uid {uid} via package_native");
+    }
+    Ok(packages)
+}
+
+/// Build a `KeyAttestationApplicationId` via `IPackageManagerNative` for ROMs
+/// that do not ship `IKeyAttestationApplicationIdProvider` (e.g. LineageOS 22.x).
+///
+/// `getPackageInfoWithSigningInfoForUid` requires the caller to be a specific
+/// privileged UID (keystore2) and is therefore unusable from OhMyKeymint's daemon
+/// process (UID 1017).  Instead we use a two-step approach that works for any
+/// caller:
+///   1. `getNamesForUids([uid])` — resolve UID → package name(s)
+///   2. `getPackageInfoWithSigningInfo(name, 0)` — fetch signing certificates per name
+///   3. `getVersionCodeForPackage(name)` — fetch the version code per name
+fn get_application_id_from_package_native(
+    uid: u32,
+) -> anyhow::Result<KeyAttestationApplicationId> {
+    let pm: rsbinder::Strong<dyn IPackageManagerNative> =
+        get_interface_once(PACKAGE_MANAGER_NATIVE_SERVICE)
+            .map_err(|e| anyhow::anyhow!("failed to connect to package_native: {e:?}"))?;
+
+    // Step 1: resolve UID → package names.
+    let names: Vec<String> = pm
+        .getNamesForUids(&[uid as i32])
+        .map_err(|e| anyhow::anyhow!("getNamesForUids({uid}) failed: {e:?}"))?
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if names.is_empty() {
+        anyhow::bail!("no packages found for uid {uid} via getNamesForUids");
+    }
+
+    // Steps 2 & 3: for each package name fetch signing info and version code.
+    let package_infos: Vec<KeyAttestationPackageInfo> = names
+        .into_iter()
+        .map(|name| {
+            // getPackageInfoWithSigningInfo(name, userId=0) is unrestricted by
+            // caller UID and returns the DER-encoded signing certificates.
+            let signatures: Vec<Signature> = pm
+                .getPackageInfoWithSigningInfo(&name, 0)
+                .unwrap_or(None)
+                .and_then(|info| info.signingInfo)
+                .map(|si| {
+                    si.apkContentSigners
+                        .into_iter()
+                        .map(|cert| Signature { data: cert.signature })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let version_code = pm.getVersionCodeForPackage(&name).unwrap_or(0);
+
+            KeyAttestationPackageInfo {
+                packageName: name,
+                versionCode: version_code,
+                signatures,
+            }
+        })
+        .collect();
+
+    Ok(KeyAttestationApplicationId { packageInfos: package_infos })
+}
+
 fn get_application_id_from_provider(uid: u32) -> anyhow::Result<KeyAttestationApplicationId> {
     let _wd = crate::watchdog::watch("get_aaid: Retrieving AAID by calling service");
     let use_legacy = super::legacy::should_use_aaid_provider();
+
+    // On LineageOS / AOSP builds that never start IKeyAttestationApplicationIdProvider,
+    // go straight to the package_native path without even attempting the legacy or
+    // IKeyAttestationApplicationIdProvider routes.
+    if !use_legacy && matches!(pm_backend(), PmBackend::PackageNative) {
+        return get_application_id_from_package_native(uid);
+    }
+
     let mut tried = 0;
     loop {
         let result = if use_legacy {

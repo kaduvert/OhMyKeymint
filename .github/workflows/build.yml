@@ -1,0 +1,252 @@
+name: Build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Build in release mode"
+        type: boolean
+        default: true
+      abi:
+        description: "Target ABI(s)"
+        type: choice
+        options: [arm64-v8a, x86_64, both]
+        default: arm64-v8a
+
+# ---------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------
+env:
+  # Android NDK package name used by sdkmanager (r27c).
+  NDK_PACKAGE: "ndk;27.2.12479018"
+  # Android API level embedded in the NDK clang wrapper names and used as the
+  # minimum SDK for the build.  Must be >= 24 (BoringSSL requirement).
+  API_LEVEL: "26"
+
+  # BoringSSL git revision.
+  #
+  # This must match the bssl-sys version declared in boringssl/Cargo.toml.
+  # To update: run `cargo metadata --format-version 1 | jq '.packages[] |
+  # select(.name=="bssl-sys") | .source'` after a `cargo update`, then look
+  # up the commit on https://boringssl.googlesource.com/boringssl.
+  BORINGSSL_REV: "be2ee342d3781ddb954f91f8a7e660e1d65bdc1f"
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Determine which ABIs to build.  We resolve the matrix here so that the
+  # subsequent job can fan out cleanly.
+  # -------------------------------------------------------------------------
+  setup:
+    runs-on: ubuntu-22.04
+    outputs:
+      abis: ${{ steps.resolve.outputs.abis }}
+      release: ${{ steps.resolve.outputs.release }}
+    steps:
+      - name: Resolve build parameters
+        id: resolve
+        run: |
+          # Push/PR → release build of arm64-v8a.
+          # workflow_dispatch → honour user inputs.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            INPUT_ABI="${{ github.event.inputs.abi }}"
+            INPUT_RELEASE="${{ github.event.inputs.release }}"
+          else
+            INPUT_ABI="arm64-v8a"
+            INPUT_RELEASE="true"
+          fi
+
+          if [ "$INPUT_ABI" = "both" ]; then
+            echo 'abis=["arm64-v8a","x86_64"]' >> "$GITHUB_OUTPUT"
+          else
+            echo "abis=[\"$INPUT_ABI\"]" >> "$GITHUB_OUTPUT"
+          fi
+          echo "release=$INPUT_RELEASE" >> "$GITHUB_OUTPUT"
+
+  # -------------------------------------------------------------------------
+  # Main build job (runs in parallel per ABI).
+  # -------------------------------------------------------------------------
+  build:
+    needs: setup
+    name: Build (${{ matrix.abi }})
+    runs-on: ubuntu-22.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: ${{ fromJson(needs.setup.outputs.abis) }}
+        include:
+          - abi: arm64-v8a
+            rust_target: aarch64-linux-android
+            bssl_build_subdir: build
+          - abi: x86_64
+            rust_target: x86_64-linux-android
+            bssl_build_subdir: build-x86_64
+
+    steps:
+      # ── Source ─────────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # git history is required by build.py (git rev-list --count HEAD).
+          fetch-depth: 0
+
+      # ── System dependencies ─────────────────────────────────────────────────
+      - name: Install system packages
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build golang-go \
+            libclang-dev clang
+
+      # ── Android NDK ─────────────────────────────────────────────────────────
+      - name: Set up Java (required by sdkmanager)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK / NDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        run: sdkmanager "${{ env.NDK_PACKAGE }}"
+
+      - name: Export NDK path
+        run: |
+          NDK_VERSION="${{ env.NDK_PACKAGE }}"
+          NDK_VERSION="${NDK_VERSION#ndk;}"
+          echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      # ── Rust ────────────────────────────────────────────────────────────────
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+          components: rustfmt, clippy
+
+      - name: Cache Cargo registry / index
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            cargo-registry-${{ runner.os }}-
+
+      # ── BoringSSL (pre-built native library + Rust wrapper) ─────────────────
+      # BoringSSL takes ~8 min to build; cache it keyed on revision + NDK +
+      # API level so it only rebuilds when one of those actually changes.
+      - name: Cache BoringSSL build
+        id: cache-bssl
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/boringssl
+          key: >-
+            boringssl-${{ matrix.rust_target }}-${{ env.BORINGSSL_REV }}-
+            ndk${{ env.NDK_PACKAGE }}-api${{ env.API_LEVEL }}
+
+      - name: Clone BoringSSL
+        if: steps.cache-bssl.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.cargo
+          git clone https://boringssl.googlesource.com/boringssl ~/.cargo/boringssl
+          git -C ~/.cargo/boringssl checkout "${{ env.BORINGSSL_REV }}"
+
+      - name: Build BoringSSL native libraries
+        if: steps.cache-bssl.outputs.cache-hit != 'true'
+        run: |
+          BSSL_SRC=~/.cargo/boringssl
+          BUILD_DIR="$BSSL_SRC/${{ matrix.bssl_build_subdir }}"
+          mkdir -p "$BUILD_DIR"
+
+          cmake -S "$BSSL_SRC" -B "$BUILD_DIR" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DANDROID_ABI="${{ matrix.abi }}" \
+            -DANDROID_PLATFORM="android-${{ env.API_LEVEL }}" \
+            -DANDROID_NDK="$ANDROID_NDK_ROOT" \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake" \
+            -DRUST_BINDINGS="${{ matrix.rust_target }}"
+
+          cmake --build "$BUILD_DIR" --target crypto ssl -- -j$(nproc)
+
+      - name: Build BoringSSL Rust wrapper (bssl-sys)
+        if: steps.cache-bssl.outputs.cache-hit != 'true'
+        run: |
+          BSSL_SRC=~/.cargo/boringssl
+          BUILD_DIR="$BSSL_SRC/${{ matrix.bssl_build_subdir }}"
+          NDK_BIN="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          LINKER="$NDK_BIN/${{ matrix.rust_target }}${{ env.API_LEVEL }}-clang"
+
+          cd "$BSSL_SRC/rust/bssl-sys"
+          BORINGSSL_BUILD_DIR="$BUILD_DIR" \
+            cargo build \
+              --release \
+              --target "${{ matrix.rust_target }}" \
+              --config "target.${{ matrix.rust_target }}.linker='$LINKER'" \
+              --config "target.${{ matrix.rust_target }}.rustflags=[\"-C\",\"link-arg=-lc++abi\"]"
+
+          # cargo puts the wrapper lib inside target/<triple>/release/build/...
+          # The build.py script expects it at a fixed path inside the build dir.
+          WRAPPER_LIB=$(find "$BSSL_SRC/rust/bssl-sys/target" \
+            -name "librust_wrapper.a" -path "*/release/*" | head -1)
+          RUST_DIR="$BUILD_DIR/rust/bssl-sys"
+          mkdir -p "$RUST_DIR"
+          cp "$WRAPPER_LIB" "$RUST_DIR/librust_wrapper.a"
+          # Copy the generated wrapper header used by subsequent cargo builds.
+          WRAPPER_RS=$(find "$BSSL_SRC/rust/bssl-sys" \
+            -name "wrapper_${{ matrix.rust_target }}.rs" | head -1)
+          [ -f "$WRAPPER_RS" ] && cp "$WRAPPER_RS" "$RUST_DIR/"
+
+      # ── Cargo config ────────────────────────────────────────────────────────
+      - name: Generate .cargo/config.toml
+        run: |
+          python3 scripts/setup_cargo_config.py \
+            --ndk-root "$ANDROID_NDK_ROOT" \
+            --api-level "${{ env.API_LEVEL }}" \
+            --force
+
+      # ── Sanity-check: working tree must be clean ────────────────────────────
+      # build.py embeds `git status --porcelain` in the zip filename and appends
+      # -dirty when anything is unclean.  Fail here with a clear message rather
+      # than silently producing a -dirty artifact.
+      - name: Assert clean working tree
+        run: |
+          STATUS=$(git status --porcelain --untracked-files=normal)
+          if [ -n "$STATUS" ]; then
+            echo "::error::Working tree is dirty — output zip would be named -dirty."
+            git status
+            exit 1
+          fi
+
+      # ── Build OhMyKeymint ───────────────────────────────────────────────────
+      - name: Build OhMyKeymint
+        env:
+          BORINGSSL_BUILD_DIR: ${{ format('{0}/.cargo/boringssl/{1}', env.HOME, matrix.bssl_build_subdir) }}
+        run: |
+          BUILD_FLAG=""
+          if [ "${{ needs.setup.outputs.release }}" = "true" ]; then
+            BUILD_FLAG="--release"
+          fi
+          python3 build.py $BUILD_FLAG --abi "${{ matrix.abi }}"
+
+      # ── Artifacts ───────────────────────────────────────────────────────────
+      - name: Upload Magisk module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: OhMyKeymint-${{ matrix.abi }}-${{ github.sha }}
+          # build.py writes the zip to the repo root.
+          path: "OhMyKeymint-*.zip"
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach zip to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "OhMyKeymint-*.zip"
