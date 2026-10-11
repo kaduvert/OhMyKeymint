@@ -1050,9 +1050,13 @@ impl KeyMintWrapper {
     pub fn new(security_level: SecurityLevel) -> Result<Self> {
         if security_level == SecurityLevel::STRONGBOX
             && !crate::plat::keymint_profile::strongbox_keymint_present()
+            && !config().read().unwrap().main.emulate_key_generation
         {
             return Err(Error::Km(ErrorCode::HARDWARE_TYPE_UNAVAILABLE))
-                .context(err!("StrongBox KeyMint HAL is not present"));
+                .context(err!(
+                    "StrongBox KeyMint HAL is not present; \
+                     set emulate_key_generation = true in config to force software emulation"
+                ));
         }
 
         Ok(KeyMintWrapper {

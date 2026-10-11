@@ -985,6 +985,19 @@ pub struct MainConfig {
     /// When enabled, OMK accepts shape-valid HATs without system KeyMint MAC verification.
     #[serde(default)]
     pub force_skip_system_biometric_hat_verification: bool,
+
+    /// Serve both TEE and StrongBox key generation entirely via OhMyKeymint's
+    /// software TA, bypassing the hardware KeyMint HAL for all operations routed
+    /// through OMK (i.e. apps in the allow-list).
+    ///
+    /// Enable this on devices where the real TEE or StrongBox is absent or has
+    /// expired attestation certificates (e.g. Pixel 3a / sargo on LineageOS 22.2).
+    /// With a valid keybox installed, key attestation and StrongBox key generation
+    /// will succeed even when the underlying hardware would otherwise fail.
+    ///
+    /// Default: false.  Requires a daemon restart to take effect.
+    #[serde(default)]
+    pub emulate_key_generation: bool,
 }
 
 fn deserialize_ta_delay_range<'de, D>(deserializer: D) -> Result<[u16; 2], D::Error>
@@ -1005,6 +1018,7 @@ impl Default for MainConfig {
             ta_generation_delay_ms: [6, 16],
             ta_control_delay_ms: [1, 4],
             force_skip_system_biometric_hat_verification: false,
+            emulate_key_generation: true,
         }
     }
 }

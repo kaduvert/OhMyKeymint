@@ -54,6 +54,7 @@ use anyhow::{Context, Result};
 use log::debug;
 use rsbinder::thread_state::CallingContext;
 use rsbinder::{Status, Strong};
+use crate::config::{config, Config, CryptoConfig, MainConfig};
 
 /// Implementation of the IKeystoreService.
 pub struct KeystoreService {
@@ -91,8 +92,22 @@ impl SecurityLevels {
 impl KeystoreService {
     /// Create a new instance of the Keystore 2.0 service.
     pub fn new_native_binder() -> Result<KeystoreService> {
+        // strongbox_enabled is true when:
+        //   (a) the hardware StrongBox KeyMint HAL is present on this device, OR
+        //   (b) emulate_key_generation is set in config — in which case OhMyKeymint
+        //       serves StrongBox via its own software TA regardless of hardware.
+        //       Needed on devices with absent or broken StrongBox (e.g. expired TEE
+        //       attestation certificates on sargo / LineageOS 22.2).
+        let emulate = config().read().unwrap().main.emulate_key_generation;
+        if emulate {
+            log::info!(
+                "emulate_key_generation is enabled; \
+                 StrongBox will be served by OhMyKeymint's software TA"
+            );
+        }
         let result = Self {
-            strongbox_enabled: crate::plat::keymint_profile::strongbox_keymint_present(),
+            strongbox_enabled: emulate
+                || crate::plat::keymint_profile::strongbox_keymint_present(),
             ..Default::default()
         };
 
